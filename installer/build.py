@@ -35,6 +35,7 @@ def main():
     pyinstaller("--name", "MUSS", "--distpath", launcher_dir, os.path.join(HERE, "muss_launcher.py"))
     pyinstaller("--name", "MUSS-Setup", "--distpath", DIST, "--paths", HERE,
                 "--add-data", f"{os.path.join(launcher_dir, 'MUSS.exe')}{os.pathsep}.",
+                "--add-data", f"{os.path.join(HERE, 'banner.png')}{os.pathsep}.",
                 "--hidden-import", "_build_info", os.path.join(HERE, "muss_setup.py"))
     out = os.path.join(DIST, "MUSS-Setup.exe")
     print(f"built {out} ({os.path.getsize(out) / 1e6:.1f} MB) for {a.version}")

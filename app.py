@@ -2917,6 +2917,30 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
 
+def _show_splash(app):
+    """The MUSS banner while the AI engine loads (a few seconds)."""
+    from PySide6.QtWidgets import QSplashScreen
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "banner.jpg")
+    pm = QPixmap(path)
+    if pm.isNull():
+        return None
+    screen = app.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen else 1.0
+    width = 800
+    if screen:
+        width = min(width, int(screen.availableGeometry().width() * 0.6))
+    pm = pm.scaledToWidth(int(width * dpr), Qt.TransformationMode.SmoothTransformation)
+    pm.setDevicePixelRatio(dpr)
+    splash = QSplashScreen(pm, Qt.WindowType.WindowStaysOnTopHint)
+    f = QFont("Segoe UI", 9)
+    splash.setFont(f)
+    splash.show()
+    splash.showMessage("Loading the AI engine...  ", Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+                       QColor("#c8cfdc"))
+    app.processEvents()
+    return splash
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -2924,11 +2948,22 @@ def main():
     app.setStyleSheet(STYLE)
     app.setQuitOnLastWindowClosed(False)            # MUSS can keep running in the tray
     app.setWindowIcon(make_icon())
+    tray_start = "--tray" in sys.argv[1:]
+    splash = None if tray_start else _show_splash(app)
     w = MainWindow()
-    if "--tray" in sys.argv[1:] and w.tray:         # started with Windows: stay hidden in the tray
+    if splash:
+        def close_splash(*_):
+            if splash.isVisible():
+                splash.finish(w)
+        w.bridge.engine_ready.connect(close_splash)  # connected after the window's own handler: runs after it
+        w.bridge.engine_failed.connect(close_splash)
+        QTimer.singleShot(30000, close_splash)       # never leave it up if something goes wrong
+    if tray_start and w.tray:                        # started with Windows: stay hidden in the tray
         w._tray_hint_shown = True
     else:
         w.show()
+        if splash:
+            splash.raise_()
     w.add_files([a for a in sys.argv[1:] if os.path.isfile(a)])
     sys.exit(app.exec())
 

@@ -299,10 +299,15 @@ def gui(args):
 
     root = tk.Tk()
     root.title(f"MUSS Setup ({VERSION})")
-    root.geometry("760x520")
+    root.geometry("760x840")
+    root.minsize(760, 760)
     frm = ttk.Frame(root, padding=14)
     frm.pack(fill="both", expand=True)
-    ttk.Label(frm, text="MUSS - Movie UpScaling Software", font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    banner = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "banner.png")
+    if os.path.exists(banner):
+        root.banner_img = tk.PhotoImage(file=banner)          # keep a reference or Tk drops the image
+        ttk.Label(frm, image=root.banner_img).pack(pady=(0, 10))
+    ttk.Label(frm, text=f"MUSS {VERSION} - Movie UpScaling Software", font=("Segoe UI", 13, "bold")).pack(anchor="w")
     ttk.Label(frm, text="Installs MUSS with everything it needs. Downloads several GB (mostly CUDA PyTorch); "
                         "an NVIDIA RTX GPU is required.", wraplength=720).pack(anchor="w", pady=(4, 10))
     row = ttk.Frame(frm)
@@ -314,9 +319,9 @@ def gui(args):
         filedialog.askdirectory(initialdir=dir_var.get()) or dir_var.get())).pack(side="left")
     sc_var = tk.BooleanVar(value=not args.no_shortcuts)
     ttk.Checkbutton(frm, text="Create Start menu and Desktop shortcuts", variable=sc_var).pack(anchor="w", pady=6)
-    bar = ttk.Progressbar(frm, mode="indeterminate")
+    bar = ttk.Progressbar(frm, mode="determinate", value=0)     # empty until Install is clicked
     bar.pack(fill="x", pady=(4, 6))
-    logbox = tk.Text(frm, height=14, font=("Consolas", 9), state="disabled")
+    logbox = tk.Text(frm, height=9, font=("Consolas", 9), state="disabled")
     logbox.pack(fill="both", expand=True)
     btns = ttk.Frame(frm)
     btns.pack(fill="x", pady=(8, 0))

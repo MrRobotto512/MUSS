@@ -1,3 +1,7 @@
+<p align="center"><img src="assets/banner.jpg" alt="MUSS - Movie UpScaling Software" width="100%"></p>
+
+<p align="center"><a href="https://github.com/MrRobotto512/MUSS/releases/latest"><b>Download MUSS-Setup.exe</b></a> · Windows · NVIDIA RTX</p>
+
 # MUSS — Movie UpScaling Software
 
 A desktop app for AI video upscaling (1080p → 4K) that uses **every NVIDIA GPU you have**, and optionally the GPUs of other PCs on your network.
