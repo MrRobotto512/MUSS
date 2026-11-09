@@ -19,6 +19,7 @@ Close-ups at 100% (left: the 1080p frame resized to 4K, right: MUSS):
 - **NVIDIA TensorRT** acceleration (~1.5–1.7× faster than PyTorch), with engines built once per model, resolution and GPU.
 - **Model library**: browse ~600 open-source models from [OpenModelDB](https://openmodeldb.info) inside MUSS — filter by scale, use (live action, anime, restoration), speed and licence — and install them in one click (download verified against OpenModelDB's SHA-256). The catalogue refreshes daily; new models and updates to installed models are flagged.
 - **Load any model**: built-in Real-ESRGAN models, plus any `.pth` / `.safetensors` file you add (ESRGAN, Compact, SPAN, SwinIR, HAT, DAT, OmniSR, RealPLKSR, … via [spandrel](https://github.com/chaiNNer-org/spandrel)). Model files are loaded weights-only, so they can't run code. Check each model's licence: many are non-commercial.
+- **Audio restoration**: AI rebuilds the high frequencies lost in low-bitrate or old audio (e.g. 128 kbps MP3/AAC, 22–32 kHz audio) up to 24 kHz with [AudioSR](https://github.com/haoheliu/versatile_audio_super_resolution). Works with or without video upscaling — upscale the video, the video and its audio, only a video's audio (picture copied untouched), or plain audio files (MP3, FLAC, WAV, M4A, …). MUSS measures where the treble stops first and leaves full-range audio alone; the original audio below the cutoff is never changed. Runs on all GPUs, resumable. The model (6.2 GB, Apache-2.0) downloads on first use.
 - **Preview like a pro**: timeline with filmstrip, in/out preview range, real-time playback of the rendered range, split / side-by-side / original / enhanced compare, zoom and pan.
 - **Resume**: stopped, crashed or interrupted exports continue from the last finished segment.
 - **Render nodes (optional)**: other PCs running MUSS can render segments over your local network (pairing-code protected). If a node drops out, its work goes back to the queue.
@@ -77,6 +78,8 @@ Install MUSS on the other PC, then either switch on **Render node** in the app's
 | `upscaler/node.py` | Render node server and client |
 | `upscaler/temporal.py` | Experimental temporal stabilizer (not wired in yet) |
 | `upscaler/updater.py` | Self-update from GitHub release tags via git |
+| `upscaler/audio.py`, `upscaler/audio_job.py` | Audio restoration: cutoff detection, AudioSR chunks, resumable jobs |
+| `upscaler/audiosr/` | Inference subset of AudioSR (MIT), adapted to run without its training dependencies |
 | `render_node.py` | Headless render node |
 | `release.py` | Publishes a new version (maintainers) |
 
@@ -86,4 +89,4 @@ Install MUSS on the other PC, then either switch on **Render node** in the app's
 
 ## Third-party components
 
-Downloaded at runtime or installed as dependencies, not included in this repository: Real-ESRGAN model weights (BSD-3-Clause), PyTorch / torchvision (BSD), spandrel (MIT), PyNvVideoCodec (MIT), NVIDIA TensorRT (NVIDIA license), PySide6 (LGPL-3.0), ffmpeg (LGPL/GPL).
+Included: an inference subset of AudioSR by Haohe Liu (MIT, see `upscaler/audiosr/LICENSE`). Downloaded at runtime or installed as dependencies, not included in this repository: AudioSR 'basic' weights (Apache-2.0), Real-ESRGAN model weights (BSD-3-Clause), PyTorch / torchvision (BSD), spandrel (MIT), PyNvVideoCodec (MIT), NVIDIA TensorRT (NVIDIA license), PySide6 (LGPL-3.0), ffmpeg (LGPL/GPL).

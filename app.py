@@ -22,6 +22,10 @@ from timeline import RangeTimeline, fmt_tc
 APP_NAME = "MUSS"
 APP_TITLE = "MUSS - Movie UpScaling Software"
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".m4v", ".webm", ".ts", ".m2ts", ".wmv", ".mts")
+AUDIO_EXTS = (".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wma", ".ac3", ".eac3", ".dts",
+              ".mka", ".aif", ".aiff", ".alac", ".ape", ".wv", ".mp2")
+UPSCALE_MODES = ["Video only", "Video + audio", "Audio only (keep picture)"]
+AUDIO_QUALITY = [("Standard (25 steps)", 25), ("High (50 steps, 2× slower)", 50)]
 
 # --------------------------------------------------------------------------- theme
 C_BG, C_PANEL, C_PANEL2, C_BORDER = "#121419", "#1a1d24", "#22262f", "#2c313c"
@@ -136,6 +140,10 @@ class QueueItem:
     r_in: float = -1.0               # preview range (seconds)
     r_out: float = -1.0
     thumbs: list = field(default_factory=list)
+    kind: str = "video"              # "video" or "audio" (audio-only files)
+    ainfo: object = None             # AudioInfo of the first audio track
+    cutoff: float | None = None      # measured treble cutoff (Hz), None = not measured yet
+    analyzing: bool = False
 
 
 class Bridge(QObject):
@@ -158,6 +166,8 @@ class Bridge(QObject):
     update_checked = Signal(object, object, bool)   # (release or None, error or None, manual)
     update_done = Signal(object, object)            # (new version or None, error or None)
     catalog_checked = Signal(int, int)              # (new models, installed models with updates)
+    audio_analyzed = Signal(object)                 # QueueItem whose audio cutoff was measured
+    audio_model_progress = Signal(int, int, object)  # (done, total, error or None / "done")
 
 
 # --------------------------------------------------------------------------- queue row
@@ -201,10 +211,18 @@ class QueueRow(QWidget):
             i = it.info
             self.meta.setText(f"{i.width}×{i.height}  ·  {fmt_time(i.duration)}")
             self.meta.setToolTip(f"{float(i.fps):.3f} fps  ·  {i.frames} frames  ·  audio: {i.audio_codec or 'none'}")
+        elif it.kind == "audio" and it.ainfo:
+            a = it.ainfo
+            ch = {1: "mono", 2: "stereo", 6: "5.1", 8: "7.1"}.get(a.channels, f"{a.channels} ch")
+            self.meta.setText(f"Audio  ·  {a.codec.upper()} {ch}  ·  {fmt_time(a.duration)}")
+            if self.thumb.pixmap() is None or self.thumb.pixmap().isNull():
+                self.thumb.setText("♪")
+                self.thumb.setStyleSheet(f"background: #0d0f13; border-radius: 5px; color: {C_ACCENT}; font-size: 22pt;")
         if it.thumb is not None:
             self.thumb.setPixmap(QPixmap.fromImage(it.thumb).scaled(
                 96, 54, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         colors = {"Done": C_OK, "Failed": C_ERR, "Processing": C_ACCENT, "Queued": C_WARN, "Stopped": C_WARN,
+                  "Skipped": C_MUTED,
                   "Scheduled": "#b18cff"}
         color = colors.get(it.status, C_MUTED)
         text = it.status if not it.detail else f"{it.status} · {it.detail}"
@@ -516,7 +534,7 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         tl.addWidget(title)
         tl.addSpacing(18)
-        self.add_btn = QPushButton("+  Add videos")
+        self.add_btn = QPushButton("+  Add files")
         tl.addWidget(self.add_btn)
         tl.addStretch(1)
         self.gpu_badge = QLabel("Detecting GPUs...")
@@ -723,6 +741,39 @@ class MainWindow(QMainWindow):
         mrow.addWidget(self.models_folder_btn)
         mrow.addStretch(1)
         s.addLayout(mrow)
+
+        section("Audio")
+        arow = QHBoxLayout()
+        alab = QLabel("Upscale")
+        alab.setFixedWidth(60)
+        self.upscale_mode_box = QComboBox()
+        self.upscale_mode_box.addItems(UPSCALE_MODES)
+        self.upscale_mode_box.setToolTip("For videos: upscale the picture, the picture and the audio, or only the "
+                                         "audio (the picture is copied unchanged). Audio files are always audio.")
+        arow.addWidget(alab)
+        arow.addWidget(self.upscale_mode_box, 1)
+        s.addLayout(arow)
+        qrow2 = QHBoxLayout()
+        qlab2 = QLabel("Quality")
+        qlab2.setFixedWidth(60)
+        self.audio_quality_box = QComboBox()
+        self.audio_quality_box.addItems([q for q, _ in AUDIO_QUALITY])
+        qrow2.addWidget(qlab2)
+        qrow2.addWidget(self.audio_quality_box, 1)
+        s.addLayout(qrow2)
+        frow2 = QHBoxLayout()
+        flab = QLabel("Audio files")
+        flab.setFixedWidth(60)
+        self.audio_format_box = QComboBox()
+        self.audio_format_box.setToolTip("Format for restored audio files. In videos the format follows the "
+                                         "container: FLAC in MKV, ALAC in MOV, 320 kbps AAC in MP4.")
+        frow2.addWidget(flab)
+        frow2.addWidget(self.audio_format_box, 1)
+        s.addLayout(frow2)
+        self.audio_hint = muted("")
+        self.audio_model_btn = QPushButton("Download AudioSR model (6.2 GB)")
+        self.audio_model_btn.hide()
+        s.addWidget(self.audio_model_btn)
 
         section("Acceleration")
         self.gpu_box = QVBoxLayout()
@@ -937,6 +988,12 @@ class MainWindow(QMainWindow):
         self.export_all_btn.clicked.connect(lambda: self._export(selected_only=False))
         self.stop_btn.clicked.connect(self._stop)
         self.start_now_btn.clicked.connect(self._start_scheduled_now)
+        self.bridge.audio_analyzed.connect(self._audio_analyzed)
+        self.bridge.audio_model_progress.connect(self._audio_model_progress)
+        self.audio_model_btn.clicked.connect(self._download_audio_model)
+        self.upscale_mode_box.currentIndexChanged.connect(self._audio_settings_changed)
+        self.audio_quality_box.currentIndexChanged.connect(self._audio_settings_changed)
+        self.audio_format_box.currentIndexChanged.connect(self._audio_settings_changed)
         self.update_btn.clicked.connect(self._show_update_dialog)
         self.version_btn.clicked.connect(lambda: self._check_updates(manual=True))
         self.check_update_btn.clicked.connect(lambda: self._check_updates(manual=True))
@@ -998,6 +1055,17 @@ class MainWindow(QMainWindow):
         self.cq_slider.setValue(int(st.value("cq", 18)))
         self._cq_changed(self.cq_slider.value())
         self.folder_edit.setText(st.value("folder", ""))
+        from upscaler import audio_job
+        for w in (self.upscale_mode_box, self.audio_quality_box, self.audio_format_box):
+            w.blockSignals(True)
+        self.audio_format_box.addItems(list(audio_job.AUDIO_FORMATS))
+        self.upscale_mode_box.setCurrentIndex(int(st.value("upscale_mode", 0)))
+        self.audio_quality_box.setCurrentIndex(int(st.value("audio_quality", 0)))
+        fmt = st.value("audio_format", "")
+        if fmt in audio_job.AUDIO_FORMATS:
+            self.audio_format_box.setCurrentText(fmt)
+        for w in (self.upscale_mode_box, self.audio_quality_box, self.audio_format_box):
+            w.blockSignals(False)
         for te, key, default in ((self.sched_start, "sched_start", "23:00"), (self.sched_end, "sched_end", "07:00")):
             te.blockSignals(True)
             te.setTime(QTime.fromString(st.value(key, default), "HH:mm"))
@@ -1012,7 +1080,8 @@ class MainWindow(QMainWindow):
         for gid, name in gpus:
             cb = QCheckBox(f"GPU {gid}  ·  {name.replace('NVIDIA ', '')}")
             cb.setChecked(saved_gpus is None or str(gid) in str(saved_gpus).split(","))
-            cb.toggled.connect(lambda _=False: (self._update_trt_hint(), self._discard_clip(), self._warm_up()))
+            cb.toggled.connect(lambda _=False: (self._update_trt_hint(), self._discard_clip(), self._warm_up(),
+                                                self._update_audio_hint()))
             self.gpu_box.addWidget(cb)
             self.gpu_checks[gid] = cb
         if not gpus:
@@ -1083,6 +1152,16 @@ class MainWindow(QMainWindow):
         dlg = ModelLibrary(self, self.settings, installed)
         dlg.exec()
         self._check_catalog()                            # refresh the "(N new)" count
+
+    def _audio_settings_changed(self, *_):
+        if not self.engine:
+            return
+        self.settings.setValue("upscale_mode", self.upscale_mode_box.currentIndex())
+        self.settings.setValue("audio_quality", self.audio_quality_box.currentIndex())
+        self.settings.setValue("audio_format", self.audio_format_box.currentText())
+        self._update_audio_hint()
+        if self.current and self.current.kind == "audio":
+            self.out_res_sub.setText(f"Saved as {self.audio_format_box.currentText()}")
 
     # ================================================================ updates (git)
     def _check_updates(self, manual):
@@ -1375,8 +1454,10 @@ class MainWindow(QMainWindow):
     # ================================================================ queue
     def _add_dialog(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Add videos", self.settings.value("last_dir", ""),
-            "Videos (" + " ".join("*" + e for e in VIDEO_EXTS) + ");;All files (*.*)")
+            self, "Add videos or audio", self.settings.value("last_dir", ""),
+            "Videos and audio (" + " ".join("*" + e for e in VIDEO_EXTS + AUDIO_EXTS) + ");;"
+            "Videos (" + " ".join("*" + e for e in VIDEO_EXTS) + ");;"
+            "Audio (" + " ".join("*" + e for e in AUDIO_EXTS) + ");;All files (*.*)")
         if files:
             self.settings.setValue("last_dir", os.path.dirname(files[0]))
             self.add_files(files)
@@ -1387,7 +1468,7 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls()]
-        self.add_files([p for p in paths if p.lower().endswith(VIDEO_EXTS)])
+        self.add_files([p for p in paths if p.lower().endswith(VIDEO_EXTS + AUDIO_EXTS)])
         model_files = [p for p in paths if self.models and p.lower().endswith(self.models.MODEL_EXTS)]
         if model_files:
             self.add_models(model_files)
@@ -1412,15 +1493,124 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def _probe_item(self, it: QueueItem):
+        from upscaler import audio_job
         try:
-            it.info = self.engine.probe(it.path)
-            buf = self.engine.grab_frame(it.path, it.info, it.info.duration * 0.1)
-            it.thumb = rgb_to_image(buf, it.info.width, it.info.height).scaled(
-                192, 108, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            it.ainfo = audio_job.probe_audio(it.path)
+            if it.path.lower().endswith(AUDIO_EXTS):
+                if it.ainfo is None:
+                    raise RuntimeError("no audio track found")
+                it.kind = "audio"
+            else:
+                it.info = self.engine.probe(it.path)
+                buf = self.engine.grab_frame(it.path, it.info, it.info.duration * 0.1)
+                it.thumb = rgb_to_image(buf, it.info.width, it.info.height).scaled(
+                    192, 108, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             it.status = "Ready"
         except Exception as e:  # noqa: BLE001
             it.status, it.detail = "Failed", f"can't read: {e}"
         self.bridge.item_loaded.emit(it)
+
+    # ---- audio analysis
+    def _audio_relevant(self, it):
+        return it is not None and it.ainfo is not None and (
+            it.kind == "audio" or self.upscale_mode_box.currentIndex() > 0)
+
+    def _analyze_audio(self, it):
+        """Measure where this item's treble stops (background, once per item)."""
+        if not self._audio_relevant(it) or it.cutoff is not None or it.analyzing:
+            return
+        it.analyzing = True
+
+        def work():
+            from upscaler import audio_job
+            try:
+                it.cutoff = audio_job.analyze_cutoff(it.path, it.ainfo)
+            except Exception as e:  # noqa: BLE001
+                self.bridge.log.emit(f"Audio analysis failed for {os.path.basename(it.path)}: {e}")
+                it.cutoff = -1
+            it.analyzing = False
+            self.bridge.audio_analyzed.emit(it)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _audio_analyzed(self, it):
+        if it is self.current:
+            self._update_audio_hint()
+            if it.kind == "audio":
+                self._show_item(it)
+
+    def _audio_estimate(self, it):
+        """Rough processing time for restoring this item's audio on the selected GPUs."""
+        from upscaler import audio
+        a = it.ainfo
+        chans = a.channels - (1 if a.channels in (6, 8) else 0)
+        chunks = chans * audio.chunks_per_channel(int(a.duration * audio.SR))
+        steps = AUDIO_QUALITY[self.audio_quality_box.currentIndex()][1]
+        # measured end to end: ~0.09 chunks/s per GPU at 25 steps (RTX 4070 + 3060 average), plus ~1 min to load
+        per_gpu = 0.09 * 25 / steps
+        return 60 + chunks / (per_gpu * max(len(self._gpus()), 1))
+
+    def _update_audio_hint(self):
+        it = self.current
+        if not self.engine:
+            return
+        from upscaler import audio, audio_job
+        lines = []
+        if not audio.weights_present():
+            lines.append("The AudioSR model (6.2 GB) will be downloaded the first time you restore audio.")
+        self.audio_model_btn.setVisible(not audio.weights_present())
+        if it is None or it.ainfo is None:
+            self.audio_hint.setText("\n".join(lines) or "Select a video or audio file.")
+            return
+        desc = audio_job.describe(it.ainfo)
+        if not self._audio_relevant(it):
+            self.audio_hint.setText(f"This video's audio: {desc} - kept as it is.")
+            return
+        if it.cutoff is None:
+            lines.insert(0, f"Audio: {desc} - measuring where the treble stops...")
+            self._analyze_audio(it)
+        elif it.cutoff < 0:
+            lines.insert(0, f"Audio: {desc} - couldn't be analysed.")
+        elif it.cutoff >= audio.FULL_RANGE_HZ:
+            lines.insert(0, f"Audio: {desc}. The treble already reaches {it.cutoff / 1000:.1f} kHz (full range): "
+                            "nothing to restore, so the audio is kept as it is.")
+        else:
+            est = self._audio_estimate(it)
+            lines.insert(0, f"Audio: {desc}. The treble stops at {it.cutoff / 1000:.1f} kHz: AudioSR will restore it "
+                            f"up to 24 kHz (≈ {fmt_time(est)} on {len(self._gpus())} GPU(s)).")
+        self.audio_hint.setText("\n".join(lines))
+
+    def _download_audio_model(self):
+        from upscaler import audio
+        if audio.weights_present() or getattr(self, "_audio_dl", False):
+            return
+        if QMessageBox.question(self, APP_NAME, "Download the AudioSR model now?\n\n6.2 GB from Hugging Face "
+                                "(haoheliu/audiosr_basic, Apache-2.0 licence). It's needed once, for restoring audio.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._audio_dl = True
+        self.audio_model_btn.setEnabled(False)
+
+        def work():
+            try:
+                audio.download_weights(progress=lambda d, t: self.bridge.audio_model_progress.emit(d, t, None),
+                                       log=lambda m: self.bridge.log.emit(m))
+                self.bridge.audio_model_progress.emit(1, 1, "done")
+            except Exception as e:  # noqa: BLE001
+                self.bridge.audio_model_progress.emit(0, 1, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _audio_model_progress(self, done, total, state):
+        if state is None:
+            self.audio_model_btn.setText(f"Downloading AudioSR...  {done / 1e9:.1f} / {total / 1e9:.1f} GB")
+            return
+        self._audio_dl = False
+        self.audio_model_btn.setEnabled(True)
+        self.audio_model_btn.setText("Download AudioSR model (6.2 GB)")
+        if state == "done":
+            self.status_text.setText("AudioSR model downloaded.")
+        else:
+            QMessageBox.warning(self, APP_NAME, f"The AudioSR download failed:\n\n{state}")
+        self._update_audio_hint()
 
     def _make_thumbs(self, it: QueueItem):
         """Filmstrip for the timeline: ~16 small frames spread over the video, grabbed in parallel."""
@@ -1463,6 +1653,8 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self._make_thumbs, args=(it,), daemon=True).start()
         if it is self.current:
             self._show_item(it)
+        elif it.kind == "audio":
+            self._analyze_audio(it)
         self._update_buttons()
 
     def _item_changed(self, it):
@@ -1487,7 +1679,33 @@ class MainWindow(QMainWindow):
             self.timeline.set_media(0, 30)
             self.out_res.setText("Select a video")
             self._update_buttons()
+            self._update_audio_hint()
             return
+        self._update_audio_hint()
+        if it.kind == "audio" and it.ainfo:
+            from upscaler import audio, audio_job
+            a = it.ainfo
+            self.view.set_frames(None, None)
+            if it.cutoff is None:
+                verdict = "Measuring where the treble stops..."
+            elif it.cutoff < 0:
+                verdict = "Couldn't analyse this file."
+            elif it.cutoff >= audio.FULL_RANGE_HZ:
+                verdict = f"Treble reaches {it.cutoff / 1000:.1f} kHz: already full range, nothing to restore."
+            else:
+                verdict = (f"Treble stops at {it.cutoff / 1000:.1f} kHz  →  AudioSR restores it up to 24 kHz.")
+            self.view.busy_text = ""
+            self.view.placeholder = (f"♪  {os.path.basename(it.path)}\n\n{audio_job.describe(a)}  ·  "
+                                     f"{fmt_time(a.duration)}\n\n{verdict}")
+            self.view.update()
+            self.timeline.set_media(0, 30)
+            self.out_res.setText(f"Audio  →  48 kHz, full range")
+            self.out_res_sub.setText(f"Saved as {self.audio_format_box.currentText()}")
+            self.tc_label.setText("")
+            self.dur_label.setText("")
+            self._update_buttons()
+            return
+        self.view.placeholder = "Drop videos here or click  + Add videos"
         if not it.info:
             self.view.busy_text = "Reading video..." if it.status == "Loading" else it.detail
             self.view.set_frames(None, None)
@@ -1516,7 +1734,7 @@ class MainWindow(QMainWindow):
         rows = sorted({self.queue_list.row(li) for li in self.queue_list.selectedItems()}, reverse=True)
         for r in rows:
             it = self.items[r]
-            if it.status in ("Processing", "Queued", "Scheduled"):
+            if it.status in ("Processing", "Queued", "Scheduled"):  # running work can't be removed
                 continue
             self.queue_list.takeItem(r)
             self.items.pop(r)
@@ -1891,6 +2109,9 @@ class MainWindow(QMainWindow):
             "folder": self.folder_edit.text().strip(), "test": self.test_check.isChecked(),
             "trt": self.trt_check.isChecked(), "range": self.range_check.isChecked(),
             "nodes": [n for n in self._load_nodes() if n.get("enabled", True)],
+            "upscale_mode": self.upscale_mode_box.currentIndex(),        # 0 video, 1 video+audio, 2 audio only
+            "audio_steps": AUDIO_QUALITY[self.audio_quality_box.currentIndex()][1],
+            "audio_format": self.audio_format_box.currentText(),
         }
 
     @staticmethod
@@ -2106,8 +2327,16 @@ class MainWindow(QMainWindow):
             chosen.sort(key=self.items.index)
         else:
             chosen = list(self.items)
-        chosen = [i for i in chosen if i.info and i.status in ("Ready", "Done", "Failed", "Cancelled", "Stopped")]
+        chosen = [i for i in chosen if (i.info or i.kind == "audio")
+                  and i.status in ("Ready", "Done", "Failed", "Cancelled", "Stopped", "Skipped")]
         if not chosen:
+            return
+        from upscaler import audio
+        needs_audio = any(i.kind == "audio" for i in chosen) or s["upscale_mode"] > 0
+        if needs_audio and not audio.weights_present():
+            QMessageBox.information(self, APP_NAME, "Restoring audio needs the AudioSR model (6.2 GB, downloaded "
+                                    "once). Download it first, then export again.")
+            self._download_audio_model()
             return
         self._discard_clip()            # free RAM and GPUs for the export
         wait = self.sched_check.isChecked() and not self._in_window() and not self._sched_override
@@ -2248,9 +2477,17 @@ class MainWindow(QMainWindow):
                 break
             if it.status != "Queued":
                 continue
-            from upscaler import export
+            from upscaler import audio_job, export
             s = it.settings
-            it.output_path = self._output_path(it.path, s, self._suffix(s))
+            if it.kind == "audio":
+                self._export_audio_file(it, s)
+                continue
+            mode = s["upscale_mode"]
+            if mode == 2:                                    # audio only: whole file, picture copied
+                s = dict(s, start=0.0, seconds=None, range=False, test=False)
+                it.output_path = self._output_path(it.path, s, "_audio")
+            else:
+                it.output_path = self._output_path(it.path, s, self._suffix(s))
             it.status, it.detail = "Processing", "starting"
             self.bridge.item_changed.emit(it)
             self.bridge.log.emit(f"=== {os.path.basename(it.path)} -> {it.output_path}")
@@ -2259,7 +2496,8 @@ class MainWindow(QMainWindow):
                 it.path, it.output_path, s["spec"], s["gpus"], s["encoder"], cq=s["cq"],
                 start_frame=round(s["start"] * fps),
                 frame_count=round(s["seconds"] * fps) if s["seconds"] else None,
-                use_tensorrt=s["trt"], remote_workers=self._remote_workers(s),
+                use_tensorrt=s["trt"], remote_workers=self._remote_workers(s) if mode != 2 else [],
+                restore_audio=mode > 0, video=mode != 2, audio_steps=s["audio_steps"],
                 on_log=lambda m, it=it: self._job_log(it, m),
                 on_progress=lambda p, it=it: self.bridge.progress.emit(it, p),
             )
@@ -2270,6 +2508,8 @@ class MainWindow(QMainWindow):
                 if ok:
                     it.status, it.progress = "Done", 1.0
                     it.detail = fmt_time(time.time() - t0) + (" (resumed)" if job.resumed_segments else "")
+                    if job.audio_note:
+                        it.detail += f" · {job.audio_note}"
                 else:
                     prog = export.resumable_progress(it.output_path)
                     pct = f"{prog[0] * 100 // max(prog[1], 1)}% saved" if prog else ""
@@ -2280,6 +2520,9 @@ class MainWindow(QMainWindow):
                     else:
                         it.status = "Stopped"
                         it.detail = f"{pct} - export again to resume" if prog else ""
+            except audio_job.NotNeeded as e:
+                it.status, it.detail = "Skipped", f"audio {e}: nothing to restore"
+                self.bridge.log.emit(f"Skipped: audio {e}.")
             except Exception as e:  # noqa: BLE001
                 it.status, it.detail = "Failed", str(e).splitlines()[0][:120]
                 prog = export.resumable_progress(it.output_path)
@@ -2289,6 +2532,43 @@ class MainWindow(QMainWindow):
             self.current_job = None
             self.bridge.item_changed.emit(it)
         self.bridge.export_idle.emit()
+
+    def _export_audio_file(self, it, s):
+        """Audio files: restore the treble and save in the chosen format (runs in the export thread)."""
+        import threading as _th
+        from upscaler import audio_job
+        ext, codec = audio_job.AUDIO_FORMATS[s["audio_format"]]
+        it.output_path = self._output_path(it.path, dict(s, ext=ext), "_restored")
+        it.status, it.detail = "Processing", "analysing audio"
+        self.bridge.item_changed.emit(it)
+        self.bridge.log.emit(f"=== {os.path.basename(it.path)} -> {it.output_path}")
+        cancel = _th.Event()
+
+        class _AudioJobHandle:                           # lets Stop / the schedule cancel this job
+            def cancel(self_):
+                cancel.set()
+        self.current_job = _AudioJobHandle()
+        t0 = time.time()
+        try:
+            r = audio_job.restore_audio_file(
+                it.path, it.output_path, s["gpus"], steps=s["audio_steps"], codec_args=codec, cancel_event=cancel,
+                on_log=lambda m: self._job_log(it, m),
+                on_progress=lambda d, t, eta: self.bridge.progress.emit(
+                    it, self.engine.Progress(d, t, 0, eta, {"Audio (AudioSR)": d})))
+            if r is False:
+                it.status, it.detail = ("Scheduled", "paused") if self._sched_pausing else ("Stopped", "export again to resume")
+                if self._sched_pausing:
+                    self.scheduled.insert(0, it)
+            else:
+                it.status, it.progress = "Done", 1.0
+                it.detail = f"{fmt_time(time.time() - t0)} · restored from {r / 1000:.1f} kHz"
+        except audio_job.NotNeeded as e:
+            it.status, it.detail = "Skipped", f"{e}: nothing to restore"
+        except Exception as e:  # noqa: BLE001
+            it.status, it.detail = "Failed", str(e).splitlines()[0][:120]
+            self.bridge.log.emit(f"Failed: {e}")
+        self.current_job = None
+        self.bridge.item_changed.emit(it)
 
     def _job_log(self, it, msg):
         self.bridge.log.emit(msg)
@@ -2301,11 +2581,19 @@ class MainWindow(QMainWindow):
             return
         if p.total:
             it.progress = min(p.done / p.total, 1.0)
-        it.detail = f"{it.progress * 100:.0f}%  ·  {p.fps:.1f} fps"
+        if "Audio (AudioSR)" in p.per_gpu:
+            it.detail = f"restoring audio {it.progress * 100:.0f}%"
+        else:
+            it.detail = f"{it.progress * 100:.0f}%  ·  {p.fps:.1f} fps"
         it.widget.refresh()
         self.status_bar.setValue(int(it.progress * 1000))
         remaining = self.export_q.qsize()
         more = f"  ·  {remaining} more queued" if remaining else ""
+        if "Audio (AudioSR)" in p.per_gpu:
+            self.status_text.setText(f"Restoring audio of {os.path.basename(it.path)}  ·  chunk {p.done}/{p.total}  ·  "
+                                     f"ETA {fmt_time(p.eta_s)}{more}")
+            self.share_text.setText("AudioSR on all GPUs")
+            return
         self.status_text.setText(f"Exporting {os.path.basename(it.path)}  ·  frame {p.done}/{p.total}  ·  "
                                  f"{p.fps:.2f} fps  ·  ETA {fmt_time(p.eta_s)}{more}")
         total = sum(p.per_gpu.values()) or 1

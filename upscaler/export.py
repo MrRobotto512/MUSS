@@ -49,7 +49,12 @@ def resumable_progress(output_path: str):
 class ExportJob:
     def __init__(self, input_path, output_path, spec: ModelSpec, gpu_ids, encoder_label, cq=18,
                  start_frame=0, frame_count=None, use_tensorrt=False, on_log=print, on_progress=None,
-                 remote_workers=None):
+                 remote_workers=None, restore_audio=False, audio_steps=None, video=True):
+        """restore_audio: also restore the audio's high frequencies (AudioSR) after the video.
+        video=False: audio only - copy the video stream untouched and restore just the audio."""
+        self.restore_audio, self.audio_steps, self.video = restore_audio, audio_steps, video
+        self.audio_job = None
+        self.audio_note = ""
         self.input_path, self.output_path, self.spec = input_path, output_path, spec
         self.gpu_ids = list(gpu_ids)
         self.encoder_label, self.cq = encoder_label, cq
@@ -68,6 +73,8 @@ class ExportJob:
     def cancel(self):
         first = not self.cancel_event.is_set()
         self.cancel_event.set()
+        if self.audio_job:
+            self.audio_job.cancel()
         with self._lock:
             procs = list(self._procs)
         for p in procs:
@@ -82,6 +89,8 @@ class ExportJob:
         """Blocking. True = finished, False = cancelled (finished segments are kept for resume)."""
         if not self.gpu_ids and not self.remote_workers:
             raise RuntimeError("Select at least one GPU.")
+        if not self.video:
+            return self._audio_only()
         info = self.info = probe(self.input_path)
         fps = float(info.fps)
         w, h = info.width, info.height
@@ -165,7 +174,13 @@ class ExportJob:
         if missing:
             raise RuntimeError(f"{len(missing)} segment(s) were not rendered.")
         report(force=True)
-        self._join(info, total)
+        audio_wav = None
+        if self.restore_audio and info.audio_codec:
+            audio_wav = self._restore_audio(self.start_frame / fps, total / fps)
+            if audio_wav is False:
+                self.log("Stopped during audio restoration; export again to resume.")
+                return False
+        self._join(info, total, audio_wav)
         shutil.rmtree(self.workdir, ignore_errors=True)
         self.log(f"Done: {total} frames. " + ", ".join(f"{k}: {v}" for k, v in per_worker.items()))
         return True
@@ -376,8 +391,49 @@ class ExportJob:
         except Exception as e:  # noqa: BLE001
             self.log(f"{node.name}: not used ({e}).")
 
+    # ------------------------------------------------------------------ audio
+    def _restore_audio(self, start_s, duration_s):
+        """Run AudioSR on the audio of this range on the local GPUs. Returns the restored WAV path,
+        None if the audio is already full range, False if cancelled."""
+        from . import audio
+        from .audio_job import AudioRestoreJob
+        from .engine import release_models
+        release_models()                                   # free the video models' GPU memory
+        self.log("Restoring the audio's high frequencies (AudioSR)...")
+        work = os.path.join(parts_dir(self.output_path), "audio")
+        self.audio_job = AudioRestoreJob(
+            self.input_path, work, self.gpu_ids, self.audio_steps or audio.DEFAULT_STEPS, start=start_s,
+            duration=duration_s, on_log=self.log, cancel_event=self.cancel_event,
+            on_progress=lambda d, t, eta: self.on_progress(Progress(d, t, 0, eta, {"Audio (AudioSR)": d})))
+        try:
+            wav = self.audio_job.run()
+        finally:
+            audio.release()
+        if wav is None:
+            self.audio_note = f"audio already full range ({self.audio_job.cutoff / 1000:.0f} kHz), kept"
+        elif wav:
+            self.audio_note = f"audio restored from {self.audio_job.cutoff / 1000:.1f} kHz"
+        return wav
+
+    def _audio_only(self):
+        """Videos in audio-only mode: copy the picture, restore the audio."""
+        from .audio_job import mux_audio_into_video, probe_audio
+        ai = probe_audio(self.input_path)
+        if ai is None:
+            raise RuntimeError("This video has no audio track.")
+        os.makedirs(parts_dir(self.output_path), exist_ok=True)
+        wav = self._restore_audio(0.0, None)
+        if wav is False:
+            return False
+        if wav is None:
+            raise AudioNotNeeded(self.audio_note)
+        self.log("Writing the video with the restored audio (picture copied unchanged)...")
+        mux_audio_into_video(self.input_path, wav, self.output_path, ai.channels)
+        shutil.rmtree(parts_dir(self.output_path), ignore_errors=True)
+        return True
+
     # ------------------------------------------------------------------ join
-    def _join(self, info, total):
+    def _join(self, info, total, audio_wav=None):
         lst = os.path.join(self.workdir, "segments.txt")
         with open(lst, "w", encoding="utf-8") as f:
             for i, _, _ in self.segments:
@@ -389,13 +445,20 @@ class ExportJob:
         cmd = [find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
                "-f", "concat", "-safe", "0", "-i", lst]
         whole = self.start_frame == 0 and total >= info.frames
-        if not whole:
-            cmd += ["-ss", f"{self.start_frame / fps:.6f}", "-t", f"{total / fps:.6f}"]
-        cmd += ["-i", self.input_path, "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1", "-c:v", "copy"]
-        if info.audio_codec and (not is_mp4 or info.audio_codec in MP4_SAFE_AUDIO):
-            cmd += ["-c:a", "copy"]
+        if audio_wav:
+            # restored audio (already trimmed to the range); metadata still comes from the source
+            from .audio_job import audio_codec_args, probe_audio
+            ai = probe_audio(audio_wav)
+            cmd += ["-i", audio_wav, "-i", self.input_path, "-map", "0:v:0", "-map", "1:a:0", "-map_metadata", "2",
+                    "-c:v", "copy", *audio_codec_args(ext, ai.channels if ai else 2)]
         else:
-            cmd += ["-c:a", "aac", "-b:a", "320k"]
+            if not whole:
+                cmd += ["-ss", f"{self.start_frame / fps:.6f}", "-t", f"{total / fps:.6f}"]
+            cmd += ["-i", self.input_path, "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1", "-c:v", "copy"]
+            if info.audio_codec and (not is_mp4 or info.audio_codec in MP4_SAFE_AUDIO):
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-c:a", "aac", "-b:a", "320k"]
         codec = ENCODERS[self.encoder_label][0]
         if is_mp4:
             if codec == "hevc_nvenc":
@@ -419,3 +482,6 @@ class ExportJob:
 
 class _Stop(Exception):
     pass
+
+
+from .audio_job import NotNeeded as AudioNotNeeded  # noqa: E402  (audio already full range)

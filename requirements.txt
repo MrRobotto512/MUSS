@@ -9,3 +9,7 @@ onnx
 spandrel==0.4.2
 safetensors
 PyNvVideoCodec==2.2.4
+# audio restoration (vendored AudioSR)
+scipy
+tqdm
+einops
