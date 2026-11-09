@@ -2,6 +2,16 @@
 
 A desktop app for AI video upscaling (1080p → 4K) that uses **every NVIDIA GPU you have**, and optionally the GPUs of other PCs on your network.
 
+## Example
+
+![1080p frame resized vs. MUSS 4K](docs/images/example_split.jpg)
+
+Close-ups at 100% (left: the 1080p frame resized to 4K, right: MUSS):
+
+![Close-up comparison](docs/images/example_crops.jpg)
+
+<sub>Upscaled with MUSS v0.2.0 using the built-in Real-ESRGAN x2 model (1920×800 → 3840×1600). Frames from *Tears of Steel*, (CC) Blender Foundation | [mango.blender.org](https://mango.blender.org), licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).</sub>
+
 ## Features
 
 - **Multi-GPU rendering**: video is split into segments; each GPU decodes, upscales and encodes its own segments, and faster cards automatically take more of the work.
@@ -72,7 +82,7 @@ Install MUSS on the other PC, then either switch on **Render node** in the app's
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) for the MUSS code. The example images in `docs/images` are frames from *Tears of Steel* (CC) Blender Foundation | mango.blender.org, licensed under CC BY 3.0, not MIT.
 
 ## Third-party components
 
