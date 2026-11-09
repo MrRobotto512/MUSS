@@ -1,0 +1,11 @@
+# Install with:  pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+# torch/torchvision are pinned to the CUDA builds: other packages (e.g. spandrel) must not pull in a CPU build.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy
+PySide6
+tensorrt-cu12==11.4.0.106
+onnx
+spandrel==0.4.2
+safetensors
+PyNvVideoCodec==2.2.4
