@@ -3,11 +3,12 @@
 __pycache__/
 *.pyc
 
-# Downloaded model weights and the custom-model folder (large; fetched or added at runtime)
-models/
+# Downloaded model weights and the custom-model folder (large; fetched or added at runtime).
+# Anchored to the project root: source folders named "models" (e.g. upscaler/audiosr/.../models) are code.
+/models/
 
 # TensorRT engines and ONNX exports (built per GPU on first use)
-engines/
+/engines/
 
 # Export work folders and partial outputs
 *.parts/
