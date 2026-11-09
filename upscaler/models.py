@@ -265,6 +265,8 @@ def add_custom_model(src: str) -> ModelSpec:
 def remove_custom_model(spec: ModelSpec):
     if not spec.path:
         raise ValueError("Built-in models can't be removed.")
+    from .catalog import purge_engines
+    purge_engines(spec.key)                     # its TensorRT engines are useless without it
     if os.path.exists(spec.path):
         os.remove(spec.path)
     with _index_lock:

@@ -157,6 +157,7 @@ class Bridge(QObject):
     nodes_status = Signal(object)              # {node key: info dict or error string}
     update_checked = Signal(object, object, bool)   # (release or None, error or None, manual)
     update_done = Signal(object, object)            # (new version or None, error or None)
+    catalog_checked = Signal(int, int)              # (new models, installed models with updates)
 
 
 # --------------------------------------------------------------------------- queue row
@@ -699,9 +700,12 @@ class MainWindow(QMainWindow):
         self.model_box.setMaxVisibleItems(20)
         s.addWidget(self.model_box)
         self.model_desc = muted()
+        self.library_btn = QPushButton("Browse model library")
+        self.library_btn.setToolTip("Browse ~600 free open-source models from OpenModelDB and install them in one click")
+        s.addWidget(self.library_btn)
         mrow = QHBoxLayout()
         mrow.setSpacing(4)
-        self.add_model_btn = QPushButton("+ Add model")
+        self.add_model_btn = QPushButton("+ Add file")
         self.add_model_btn.setToolTip("Add an upscaling model file (.pth / .safetensors). You can also drop "
                                       "model files onto the window.")
         self.remove_model_btn = QToolButton()
@@ -713,11 +717,11 @@ class MainWindow(QMainWindow):
         self.find_models_btn = QToolButton()
         self.find_models_btn.setText("Find ↗")
         self.find_models_btn.setToolTip("Browse free community models on OpenModelDB (opens your browser)")
+        self.find_models_btn.hide()                      # superseded by the in-app library
         mrow.addWidget(self.add_model_btn)
         mrow.addWidget(self.remove_model_btn)
         mrow.addWidget(self.models_folder_btn)
         mrow.addStretch(1)
-        mrow.addWidget(self.find_models_btn)
         s.addLayout(mrow)
 
         section("Acceleration")
@@ -918,6 +922,8 @@ class MainWindow(QMainWindow):
 
         self.model_box.currentIndexChanged.connect(self._model_changed)
         self.add_model_btn.clicked.connect(self._add_model_dialog)
+        self.library_btn.clicked.connect(self._open_library)
+        self.bridge.catalog_checked.connect(self._catalog_checked)
         self.remove_model_btn.clicked.connect(self._remove_model)
         self.models_folder_btn.clicked.connect(self._open_models_folder)
         self.find_models_btn.clicked.connect(
@@ -1037,6 +1043,46 @@ class MainWindow(QMainWindow):
             self._check_updates(manual=False)
         else:
             self.update_hint.setText("")
+        self._check_catalog()
+
+    # ================================================================ model library (OpenModelDB)
+    def _check_catalog(self):
+        """Refresh the model catalogue in the background (at most daily) and count new models / model updates."""
+        import json as _json
+        try:
+            seen = set(_json.loads(self.settings.value("catalog_seen", "[]")))
+        except (TypeError, ValueError):
+            seen = set()
+
+        def work():
+            from upscaler import catalog
+            try:
+                cat = [m for m in catalog.load_catalog() if m.supported]
+            except Exception:  # noqa: BLE001
+                return                                    # offline: the library still opens from cache
+            new = len({m.id for m in cat} - seen) if seen else 0
+            inst, imap = catalog.installed_ids(), catalog._installed_map()
+            upd = sum(1 for m in cat if catalog.status_of(m, inst, imap) == "update")
+            self.bridge.catalog_checked.emit(new, upd)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _catalog_checked(self, new, upd):
+        parts = ([f"{new} new"] if new else []) + ([f"{upd} update{'s' if upd > 1 else ''}"] if upd else [])
+        self.library_btn.setText("Browse model library" + (f"  ({', '.join(parts)})" if parts else ""))
+        if parts:
+            self.log(f"Model library: {', '.join(parts)}.")
+
+    def _open_library(self):
+        from model_library import ModelLibrary
+
+        def installed(spec):
+            if self.exporting:
+                return
+            self.engine.release_models()                 # an updated model must be reloaded
+            self._models_changed(spec.key, None)
+        dlg = ModelLibrary(self, self.settings, installed)
+        dlg.exec()
+        self._check_catalog()                            # refresh the "(N new)" count
 
     # ================================================================ updates (git)
     def _check_updates(self, manual):
