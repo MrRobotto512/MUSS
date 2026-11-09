@@ -91,6 +91,71 @@ def rgb_to_image(buf: bytes, w: int, h: int) -> QImage:
     return QImage(buf, w, h, w * 3, QImage.Format.Format_RGB888).copy()
 
 
+def make_icon():
+    """The MUSS icon, drawn in code (blue rounded square with a white 'M' and a 4K-style corner mark)."""
+    from PySide6.QtGui import QIcon
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C_ACCENT))
+        r = size * 0.2
+        p.drawRoundedRect(QRectF(0, 0, size, size), r, r)
+        f = QFont("Segoe UI")
+        f.setBold(True)
+        f.setPixelSize(int(size * 0.62))
+        p.setFont(f)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(QRectF(0, -size * 0.04, size, size), Qt.AlignmentFlag.AlignCenter, "M")
+        p.setBrush(QColor("#ffffff"))
+        p.setPen(Qt.PenStyle.NoPen)
+        d = size * 0.16
+        p.drawEllipse(QRectF(size - d * 1.5, size - d * 1.5, d, d))
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def startup_command() -> str:
+    """Command Windows runs at login: MUSS.exe from an installer install, else this app.py with pythonw."""
+    home = os.environ.get("MUSS_HOME")
+    if home and os.path.isfile(os.path.join(home, "MUSS.exe")):
+        return f'"{os.path.join(home, "MUSS.exe")}" --tray'
+    exe = sys.executable
+    if exe.lower().endswith("python.exe") and os.path.isfile(exe[:-10] + "pythonw.exe"):
+        exe = exe[:-10] + "pythonw.exe"
+    return f'"{exe}" "{os.path.abspath(__file__)}" --tray'
+
+
+def startup_enabled() -> bool:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, APP_NAME)
+            return True
+    except OSError:
+        return False
+
+
+def set_startup(on: bool):
+    """Add/remove MUSS in the current user's startup programs (HKCU Run key; no admin rights needed)."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(k, APP_NAME)
+            except FileNotFoundError:
+                pass
+
+
 def wrap_image(buf: bytes, w: int, h: int) -> QImage:
     """Zero-copy view of RGB bytes; only valid while buf is alive (convert to QPixmap right away)."""
     return QImage(buf, w, h, w * 3, QImage.Format.Format_RGB888)
@@ -144,6 +209,7 @@ class QueueItem:
     ainfo: object = None             # AudioInfo of the first audio track
     cutoff: float | None = None      # measured treble cutoff (Hz), None = not measured yet
     analyzing: bool = False
+    restore: dict | None = None      # saved queue state, applied once the file has been read
 
 
 class Bridge(QObject):
@@ -512,6 +578,14 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect()
+        self.setWindowIcon(make_icon())
+        self._really_quit = False
+        self._tray_hint_shown = False
+        self._setup_tray()
+        self.save_timer = QTimer(self)               # debounced queue saving
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(800)
+        self.save_timer.timeout.connect(self._save_queue)
         self._set_enabled(False)
         self.log("Starting AI engine (PyTorch)...")
         threading.Thread(target=self._load_engine, daemon=True).start()
@@ -857,7 +931,15 @@ class MainWindow(QMainWindow):
         s.addLayout(trow)
         self.sched_hint = muted("")
 
-        section("Updates")
+        section("App")
+        self.startup_check = QCheckBox("Start MUSS when Windows starts (in the tray)")
+        self.startup_check.setToolTip("MUSS starts hidden in the system tray when you log in, so a scheduled queue\n"
+                                      "runs without opening anything. Untick to remove it from startup.")
+        s.addWidget(self.startup_check)
+        self.tray_check = QCheckBox("Keep running in the tray when the window is closed")
+        self.tray_check.setToolTip("Closing the window hides MUSS to the system tray (next to the clock) instead of\n"
+                                   "quitting, so exports and the schedule keep going. Quit from the tray menu.")
+        s.addWidget(self.tray_check)
         urow = QHBoxLayout()
         self.auto_update_check = QCheckBox("Check for updates at startup")
         self.check_update_btn = QToolButton()
@@ -988,6 +1070,8 @@ class MainWindow(QMainWindow):
         self.export_all_btn.clicked.connect(lambda: self._export(selected_only=False))
         self.stop_btn.clicked.connect(self._stop)
         self.start_now_btn.clicked.connect(self._start_scheduled_now)
+        self.startup_check.toggled.connect(self._startup_toggled)
+        self.tray_check.toggled.connect(lambda on: self.settings.setValue("close_to_tray", "true" if on else "false"))
         self.bridge.audio_analyzed.connect(self._audio_analyzed)
         self.bridge.audio_model_progress.connect(self._audio_model_progress)
         self.audio_model_btn.clicked.connect(self._download_audio_model)
@@ -1113,6 +1197,15 @@ class MainWindow(QMainWindow):
         else:
             self.update_hint.setText("")
         self._check_catalog()
+        for cb, val in ((self.startup_check, startup_enabled()),
+                        (self.tray_check, st.value("close_to_tray", "true") == "true")):
+            cb.blockSignals(True)
+            cb.setChecked(val)
+            cb.blockSignals(False)
+        if not self.tray:
+            self.tray_check.setEnabled(False)
+            self.tray_check.setToolTip("The system tray isn't available.")
+        self._restore_queue()
 
     # ================================================================ model library (OpenModelDB)
     def _check_catalog(self):
@@ -1491,6 +1584,7 @@ class MainWindow(QMainWindow):
         if self.queue_list.currentRow() < 0 and self.items:
             self.queue_list.setCurrentRow(0)
         self._update_buttons()
+        self._queue_changed()
 
     def _probe_item(self, it: QueueItem):
         from upscaler import audio_job
@@ -1642,6 +1736,8 @@ class MainWindow(QMainWindow):
             self.timeline.set_thumbs(it.thumbs)
 
     def _item_loaded(self, it):
+        if it.restore is not None:
+            self._apply_restore(it)
         if it.status == "Ready":
             prog = self._resume_info(it)
             if prog and prog[0]:
@@ -1661,6 +1757,7 @@ class MainWindow(QMainWindow):
         if it.widget:
             it.widget.refresh()
         self._update_buttons()
+        self._queue_changed()
 
     def _select_row(self, row):
         it = self.items[row] if 0 <= row < len(self.items) else None
@@ -1741,6 +1838,7 @@ class MainWindow(QMainWindow):
         self.current = None
         self._select_row(self.queue_list.currentRow())
         self._update_buttons()
+        self._queue_changed()
 
     def _clear_done(self):
         for r in reversed(range(len(self.items))):
@@ -1750,6 +1848,7 @@ class MainWindow(QMainWindow):
         self.current = None
         self._select_row(self.queue_list.currentRow())
         self._update_buttons()
+        self._queue_changed()
 
     def _update_buttons(self):
         ready = self.engine is not None and bool(self.gpu_checks)
@@ -2382,6 +2481,7 @@ class MainWindow(QMainWindow):
             self.scheduled.append(it)
         if it.widget:
             it.widget.refresh()
+        self._queue_changed()
 
     def _sched_settings_changed(self, *_):
         st = self.settings
@@ -2613,8 +2713,16 @@ class MainWindow(QMainWindow):
         done = [i for i in self.items if i.status == "Done"]
         self.status_text.setText(f"Export finished. {len(done)} video(s) done." if done else "Export stopped.")
         self.log("Export queue paused by the schedule." if paused else "Export queue finished.")
+        if not self.isVisible():                     # running in the tray: tell the user
+            failed = [i for i in self.items if i.status == "Failed"]
+            if paused:
+                self.notify("MUSS paused", f"The schedule window ended; {len(self.scheduled)} item(s) continue "
+                                           f"at {self.sched_start.time().toString('HH:mm')}.")
+            else:
+                self.notify("MUSS queue finished", f"{len(done)} done" + (f", {len(failed)} failed" if failed else "") + ".")
         self._sched_refresh()
         self._update_buttons()
+        self._queue_changed()
 
     def _stop(self):
         while True:
@@ -2634,6 +2742,137 @@ class MainWindow(QMainWindow):
             self.status_text.setText("Stopping...")
         self._sched_refresh()
         self._update_buttons()
+        self._queue_changed()
+
+    # ================================================================ tray + startup
+    def _setup_tray(self):
+        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(make_icon(), self)
+        self.tray.setToolTip(APP_TITLE)
+        menu = QMenu()
+        self.tray_status = menu.addAction("Idle")
+        self.tray_status.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Show MUSS", self._show_from_tray)
+        self.tray_start_now = menu.addAction("Start scheduled videos now", self._start_scheduled_now)
+        self.tray_stop = menu.addAction("Stop the queue", self._stop)
+        menu.addSeparator()
+        menu.addAction("Quit MUSS", self._quit_from_tray)
+        menu.aboutToShow.connect(self._refresh_tray_menu)
+        self.tray.setContextMenu(menu)
+        self.tray_menu = menu
+        self.tray.activated.connect(
+            lambda reason: self._show_from_tray() if reason in (QSystemTrayIcon.ActivationReason.DoubleClick,
+                                                                QSystemTrayIcon.ActivationReason.Trigger) else None)
+        self.tray.show()
+
+    def _refresh_tray_menu(self):
+        if self.exporting:
+            text = self.status_text.text()[:70] or "Exporting..."
+        elif self.scheduled:
+            text = f"{len(self.scheduled)} scheduled - starts at {self.sched_start.time().toString('HH:mm')}"
+        else:
+            text = "Idle"
+        self.tray_status.setText(text)
+        self.tray_start_now.setEnabled(bool(self.scheduled) and not self.exporting)
+        self.tray_stop.setEnabled(self.exporting or bool(self.scheduled))
+        if self.tray:
+            self.tray.setToolTip(f"{APP_TITLE}\n{text}")
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._really_quit = True
+        self._show_from_tray() if (self.exporting or self.scheduled) else None
+        if not self.close():                       # the user cancelled the "stop and quit?" question
+            self._really_quit = False
+            return
+        QApplication.quit()
+
+    def notify(self, title, text):
+        if self.tray:
+            self.tray.showMessage(title, text, make_icon(), 8000)
+
+    def _startup_toggled(self, on):
+        try:
+            set_startup(on)
+            self.log("MUSS will start with Windows (in the tray)." if on else "MUSS removed from Windows startup.")
+        except OSError as e:
+            QMessageBox.warning(self, APP_NAME, f"Couldn't change the startup setting:\n{e}")
+            self.startup_check.blockSignals(True)
+            self.startup_check.setChecked(startup_enabled())
+            self.startup_check.blockSignals(False)
+
+    # ================================================================ queue persistence
+    def _queue_changed(self, *_):
+        if hasattr(self, "save_timer"):
+            self.save_timer.start()
+
+    def _save_queue(self):
+        """Persist the queue (paths, status, settings, preview range) so it survives restarts and logins."""
+        import json
+        out = []
+        for it in self.items:
+            s = dict(it.settings)
+            if s.get("spec") is not None and not isinstance(s.get("spec"), str):
+                s["spec"] = s["spec"].key
+            status = it.status
+            if status in ("Processing", "Queued"):
+                status = "Interrupted"             # was running/waiting when MUSS closed
+            out.append({"path": it.path, "status": status, "detail": it.detail, "output": it.output_path,
+                        "settings": s, "r_in": it.r_in, "r_out": it.r_out, "playhead": it.playhead})
+        self.settings.setValue("queue", json.dumps(out))
+
+    def _restore_queue(self):
+        import json
+        try:
+            saved = json.loads(self.settings.value("queue", "[]"))
+        except (TypeError, ValueError):
+            saved = []
+        missing = [e["path"] for e in saved if not os.path.isfile(e["path"])]
+        for p in missing:
+            self.log(f"Queue: {p} no longer exists - removed from the queue.")
+        entries = [e for e in saved if os.path.isfile(e["path"])]
+        if not entries:
+            return
+        self.add_files([e["path"] for e in entries])
+        by_path = {os.path.normcase(os.path.normpath(e["path"])): e for e in entries}
+        for it in self.items:
+            it.restore = by_path.get(os.path.normcase(it.path))
+        self.log(f"Restored {len(entries)} item(s) from the saved queue.")
+
+    def _apply_restore(self, it):
+        """Called once the item's file has been read: bring back its saved state."""
+        e, it.restore = it.restore, None
+        if not e or it.status != "Ready":
+            return
+        if e.get("r_out", -1) > e.get("r_in", -1) >= 0:
+            it.r_in, it.r_out, it.playhead = e["r_in"], e["r_out"], e.get("playhead", e["r_in"])
+        s = dict(e.get("settings") or {})
+        if s.get("spec") is not None:
+            spec = getattr(self, "specs", {}).get(s["spec"])
+            if spec is None:
+                it.status, it.detail = "Failed", f"model '{s['spec']}' is no longer installed"
+                return
+            s["spec"] = spec
+        status = e.get("status")
+        if status in ("Done", "Skipped", "Failed", "Stopped"):
+            it.status, it.detail, it.output_path = status, e.get("detail", ""), e.get("output", "")
+            it.progress = 1.0 if status == "Done" else 0.0
+        elif status in ("Scheduled", "Interrupted") and s:
+            it.settings = s
+            if status == "Scheduled" or self.sched_check.isChecked():
+                self._schedule_item(it, e.get("detail") if status == "Scheduled" else "interrupted - continues next window")
+            else:
+                it.status, it.detail = "Stopped", "interrupted - export again to resume"
+        self._sched_refresh()
+        self._sched_tick()
 
     # ================================================================ log + close
     def log(self, msg):
@@ -2645,9 +2884,19 @@ class MainWindow(QMainWindow):
             self.status_text.setText(msg.splitlines()[0][:160])
 
     def closeEvent(self, e):
+        self._save_queue()
+        if not self._really_quit and self.tray and self.tray_check.isChecked():
+            e.ignore()                              # keep running in the tray
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                busy = "Exports and the schedule keep running. " if (self.exporting or self.scheduled) else ""
+                self.notify("MUSS is still running", f"{busy}Open or quit MUSS from the tray icon.")
+            return
         if self.scheduled and not self.exporting:
             if QMessageBox.question(self, APP_NAME, f"{len(self.scheduled)} video(s) are scheduled. They only run "
-                                    "while the app is open.\n\nQuit anyway?") != QMessageBox.StandardButton.Yes:
+                                    "while MUSS is running (it can stay in the tray).\n\nQuit anyway?") \
+                    != QMessageBox.StandardButton.Yes:
                 e.ignore()
                 return
         self._keep_awake(False)
@@ -2661,7 +2910,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "node_server", None):
             self.node_server.stop()
         self._discard_clip()
+        self._save_queue()
+        if self.tray:
+            self.tray.hide()
         e.accept()
+        QApplication.quit()
 
 
 def main():
@@ -2669,8 +2922,13 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+    app.setQuitOnLastWindowClosed(False)            # MUSS can keep running in the tray
+    app.setWindowIcon(make_icon())
     w = MainWindow()
-    w.show()
+    if "--tray" in sys.argv[1:] and w.tray:         # started with Windows: stay hidden in the tray
+        w._tray_hint_shown = True
+    else:
+        w.show()
     w.add_files([a for a in sys.argv[1:] if os.path.isfile(a)])
     sys.exit(app.exec())
 
