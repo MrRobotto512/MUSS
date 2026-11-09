@@ -1,0 +1,49 @@
+name: Build Windows installer
+
+# Every version tag (v0.3.0, ...) builds MUSS-Setup.exe and attaches it to that tag's GitHub release
+# (the release is created if it doesn't exist yet). Can also be started by hand from the Actions tab;
+# then the installer is only kept as a workflow artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build MUSS-Setup.exe
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyinstaller>=6.10"
+          $version = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "main" }
+          python installer/build.py --version $version
+
+      - name: Keep the installer as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MUSS-Setup
+          path: dist/MUSS-Setup.exe
+
+      - name: Attach to the GitHub release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --verify-tag --title "MUSS $tag" --generate-notes
+          }
+          gh release upload $tag dist/MUSS-Setup.exe --clobber

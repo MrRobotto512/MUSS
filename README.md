@@ -24,6 +24,7 @@ Close-ups at 100% (left: the 1080p frame resized to 4K, right: MUSS):
 - **Resume**: stopped, crashed or interrupted exports continue from the last finished segment.
 - **Render nodes (optional)**: other PCs running MUSS can render segments over your local network (pairing-code protected). If a node drops out, its work goes back to the queue.
 - **Schedule**: run the queue only within a time window (e.g. overnight); it pauses at the end of the window and resumes in the next one.
+- **Runs in the background**: closing the window keeps MUSS in the system tray (exports and the schedule continue; notifications when the queue finishes), and it can start with Windows hidden in the tray. The queue is saved and restored across restarts, so a scheduled queue survives a reboot.
 - Queue with batch export, range export, quick 10-second tests.
 
 ## Requirements
@@ -34,7 +35,9 @@ Close-ups at 100% (left: the 1080p frame resized to 4K, right: MUSS):
 
 ## Install
 
-Install with git, so MUSS can update itself:
+**Easiest:** download **`MUSS-Setup.exe`** from the [latest release](https://github.com/MrRobotto512/MUSS/releases/latest) and run it. It needs no admin rights and nothing pre-installed: it gets Python 3.14 (via [uv](https://github.com/astral-sh/uv)), Git and an NVENC-capable ffmpeg if you don't have them (checksums verified), installs everything into one folder (default `%LOCALAPPDATA%\Programs\MUSS`, several GB, mostly CUDA PyTorch), and adds Start menu / Desktop shortcuts and an uninstall entry. Start MUSS from the shortcut (`MUSS.exe`).
+
+**From source** (developers):
 
 ```bat
 git clone https://github.com/MrRobotto512/MUSS.git
@@ -42,7 +45,9 @@ cd MUSS
 setup.bat
 ```
 
-`setup.bat` creates `.venv` and installs PyTorch (CUDA 12.8), TensorRT, PySide6 and the other dependencies (several GB). Then start the app with **`MUSS.bat`**.
+`setup.bat` creates `.venv` and installs PyTorch (CUDA 12.8), TensorRT, PySide6 and the other dependencies. Then start the app with **`MUSS.bat`**.
+
+Both kinds of install are git checkouts, so MUSS can update itself.
 
 ## Updates
 
@@ -54,7 +59,7 @@ At startup MUSS checks GitHub for a newer release (a version tag such as `v0.3.0
 .venv\Scripts\python.exe release.py 0.3.0 "What changed"
 ```
 
-This sets the version, commits, tags `v0.3.0` and pushes the commit and tag. Pushing to `main` without a tag doesn't update anyone.
+This sets the version, commits, tags `v0.3.0` and pushes the commit and tag. Pushing to `main` without a tag doesn't update anyone. The tag also triggers the **Build Windows installer** GitHub Actions workflow (`.github/workflows/release.yml`), which builds `MUSS-Setup.exe` with PyInstaller, creates the GitHub release if it doesn't exist and attaches the installer to it.
 
 > `torch` / `torchvision` are pinned to the CUDA builds in `requirements.txt`. Installing other torch-dependent packages without `--extra-index-url https://download.pytorch.org/whl/cu128` can silently replace them with CPU-only builds.
 
@@ -82,6 +87,8 @@ Install MUSS on the other PC, then either switch on **Render node** in the app's
 | `upscaler/audiosr/` | Inference subset of AudioSR (MIT), adapted to run without its training dependencies |
 | `render_node.py` | Headless render node |
 | `release.py` | Publishes a new version (maintainers) |
+| `installer/` | `MUSS-Setup.exe` (installer) and `MUSS.exe` (launcher) sources, and their PyInstaller build script |
+| `.github/workflows/release.yml` | Builds the installer and attaches it to the release on every version tag |
 
 ## License
 

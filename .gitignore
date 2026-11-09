@@ -10,6 +10,11 @@ __pycache__/
 # TensorRT engines and ONNX exports (built per GPU on first use)
 /engines/
 
+# Installer build output
+/build/
+/dist/
+installer/_build_info.py
+
 # Export work folders and partial outputs
 *.parts/
 *.joining
