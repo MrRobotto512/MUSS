@@ -155,6 +155,8 @@ class Bridge(QObject):
     warm_done = Signal(object)
     models_changed = Signal(object, object)    # (key to select or None, error or None)
     nodes_status = Signal(object)              # {node key: info dict or error string}
+    update_checked = Signal(object, object, bool)   # (release or None, error or None, manual)
+    update_done = Signal(object, object)            # (new version or None, error or None)
 
 
 # --------------------------------------------------------------------------- queue row
@@ -523,6 +525,16 @@ class MainWindow(QMainWindow):
         self.log_btn = QToolButton()
         self.log_btn.setText("Log")
         self.log_btn.setCheckable(True)
+        from upscaler import __version__ as muss_version
+        self.update_btn = QPushButton("Update available")
+        self.update_btn.setObjectName("primary")
+        self.update_btn.setStyleSheet("padding: 4px 12px; font-size: 9.5pt;")
+        self.update_btn.hide()
+        self.version_btn = QToolButton()
+        self.version_btn.setText(f"v{muss_version}")
+        self.version_btn.setToolTip("Check for updates")
+        tl.addWidget(self.update_btn)
+        tl.addWidget(self.version_btn)
         self.node_mode_btn = QToolButton()
         self.node_mode_btn.setText("Render node: off")
         self.node_mode_btn.setCheckable(True)
@@ -789,6 +801,17 @@ class MainWindow(QMainWindow):
         trow.addStretch(1)
         s.addLayout(trow)
         self.sched_hint = muted("")
+
+        section("Updates")
+        urow = QHBoxLayout()
+        self.auto_update_check = QCheckBox("Check for updates at startup")
+        self.check_update_btn = QToolButton()
+        self.check_update_btn.setText("Check now")
+        urow.addWidget(self.auto_update_check)
+        urow.addStretch(1)
+        urow.addWidget(self.check_update_btn)
+        s.addLayout(urow)
+        self.update_hint = muted("")
         s.addStretch(1)
 
         foot = QVBoxLayout()
@@ -908,6 +931,13 @@ class MainWindow(QMainWindow):
         self.export_all_btn.clicked.connect(lambda: self._export(selected_only=False))
         self.stop_btn.clicked.connect(self._stop)
         self.start_now_btn.clicked.connect(self._start_scheduled_now)
+        self.update_btn.clicked.connect(self._show_update_dialog)
+        self.version_btn.clicked.connect(lambda: self._check_updates(manual=True))
+        self.check_update_btn.clicked.connect(lambda: self._check_updates(manual=True))
+        self.auto_update_check.toggled.connect(
+            lambda on: self.settings.setValue("auto_update", "true" if on else "false"))
+        self.bridge.update_checked.connect(self._update_checked)
+        self.bridge.update_done.connect(self._update_done)
         self.sched_check.toggled.connect(self._sched_settings_changed)
         self.sched_start.timeChanged.connect(self._sched_settings_changed)
         self.sched_end.timeChanged.connect(self._sched_settings_changed)
@@ -1000,6 +1030,101 @@ class MainWindow(QMainWindow):
                 threading.Thread(target=self._probe_item, args=(it,), daemon=True).start()
         self._update_buttons()
         self._check_nodes()
+        self.auto_update_check.blockSignals(True)
+        self.auto_update_check.setChecked(st.value("auto_update", "true") == "true")
+        self.auto_update_check.blockSignals(False)
+        if self.auto_update_check.isChecked():
+            self._check_updates(manual=False)
+        else:
+            self.update_hint.setText("")
+
+    # ================================================================ updates (git)
+    def _check_updates(self, manual):
+        from upscaler import updater
+        reason = updater.status()
+        if reason:
+            self.update_hint.setText(reason.splitlines()[0])
+            if manual:
+                QMessageBox.information(self, APP_NAME, reason)
+            return
+        self.update_hint.setText("Checking GitHub for updates...")
+        self.check_update_btn.setEnabled(False)
+
+        def work():
+            try:
+                self.bridge.update_checked.emit(updater.check_latest(), None, manual)
+            except Exception as e:  # noqa: BLE001
+                self.bridge.update_checked.emit(None, str(e), manual)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_checked(self, release, error, manual):
+        from upscaler import __version__ as muss_version
+        self.check_update_btn.setEnabled(True)
+        self.pending_update = release
+        if error:
+            self.update_hint.setText("Couldn't check for updates (offline?).")
+            self.log("Update check failed: " + error)
+            if manual:
+                QMessageBox.warning(self, APP_NAME, f"Couldn't check for updates:\n\n{error}")
+            return
+        if release:
+            self.update_btn.setText(f"Update to v{release['version']}")
+            self.update_btn.show()
+            self.update_hint.setText(f"MUSS v{release['version']} is available (you have v{muss_version}).")
+            self.log(f"Update available: v{release['version']}")
+            if manual:
+                self._show_update_dialog()
+        else:
+            self.update_btn.hide()
+            self.update_hint.setText(f"You have the latest version (v{muss_version}).")
+            if manual:
+                QMessageBox.information(self, APP_NAME, f"MUSS v{muss_version} is the latest version.")
+
+    def _show_update_dialog(self):
+        from upscaler import __version__ as muss_version
+        rel = getattr(self, "pending_update", None)
+        if not rel:
+            return
+        if self.exporting or self.scheduled:
+            QMessageBox.information(self, APP_NAME, "Finish or stop the export queue (including scheduled "
+                                    "videos) before updating; MUSS restarts after the update.")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle(f"{APP_NAME} update")
+        box.setText(f"MUSS v{rel['version']} is available (you have v{muss_version}).")
+        box.setInformativeText("What's new:\n" + rel["notes"][:1500] +
+                               "\n\nMUSS will download the update from GitHub and restart.")
+        upd = box.addButton("Update and restart", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not upd:
+            return
+        self._discard_clip()
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("Updating...")
+        self.status_text.setText(f"Updating to v{rel['version']}...")
+
+        def work():
+            from upscaler import updater
+            try:
+                v = updater.apply_update(rel, log=lambda m: self.bridge.log.emit(m))
+                self.bridge.update_done.emit(v, None)
+            except Exception as e:  # noqa: BLE001
+                self.bridge.update_done.emit(None, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _update_done(self, version, error):
+        from upscaler import updater
+        if error:
+            self.update_btn.setEnabled(True)
+            self.update_btn.setText(f"Update to v{self.pending_update['version']}")
+            self.status_text.setText("Update failed - see Log")
+            QMessageBox.warning(self, APP_NAME, f"The update was not applied:\n\n{error}")
+            return
+        self.status_text.setText(f"Updated to v{version} - restarting...")
+        updater.restart_app()
+        self._restarting = True
+        self.close()
 
     # ================================================================ settings
     def _spec(self):

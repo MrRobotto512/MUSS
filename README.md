@@ -20,13 +20,29 @@ A desktop app for AI video upscaling (1080p → 4K) that uses **every NVIDIA GPU
 - Python 3.14
 - `ffmpeg` / `ffprobe` with NVENC: MUSS uses the copy bundled with Topaz Video AI if it is installed, otherwise the ones on your `PATH`
 
-## Setup
+## Install
+
+Install with git, so MUSS can update itself:
 
 ```bat
+git clone https://github.com/MrRobotto512/MUSS.git
+cd MUSS
 setup.bat
 ```
 
-This creates `.venv` and installs PyTorch (CUDA 12.8), TensorRT, PySide6 and the other dependencies (several GB). Then start the app with **`MUSS.bat`**.
+`setup.bat` creates `.venv` and installs PyTorch (CUDA 12.8), TensorRT, PySide6 and the other dependencies (several GB). Then start the app with **`MUSS.bat`**.
+
+## Updates
+
+At startup MUSS checks GitHub for a newer release (a version tag such as `v0.3.0`) and shows **Update to v…** in the top bar with the list of changes. **Update and restart** fast-forwards the install to that tag with git and reinstalls Python packages only if `requirements.txt` changed; if that fails it goes back to the previous version. Click the version number in the top bar to check manually; automatic checks can be turned off under **Settings → Updates**. An install with uncommitted local changes is never overwritten.
+
+**Publishing a release** (maintainers): commit your changes, then
+
+```bat
+.venv\Scripts\python.exe release.py 0.3.0 "What changed"
+```
+
+This sets the version, commits, tags `v0.3.0` and pushes the commit and tag. Pushing to `main` without a tag doesn't update anyone.
 
 > `torch` / `torchvision` are pinned to the CUDA builds in `requirements.txt`. Installing other torch-dependent packages without `--extra-index-url https://download.pytorch.org/whl/cu128` can silently replace them with CPU-only builds.
 
@@ -47,7 +63,13 @@ Install MUSS on the other PC, then either switch on **Render node** in the app's
 | `upscaler/models.py` | Built-in and custom model handling |
 | `upscaler/node.py` | Render node server and client |
 | `upscaler/temporal.py` | Experimental temporal stabilizer (not wired in yet) |
+| `upscaler/updater.py` | Self-update from GitHub release tags via git |
 | `render_node.py` | Headless render node |
+| `release.py` | Publishes a new version (maintainers) |
+
+## License
+
+[MIT](LICENSE)
 
 ## Third-party components
 
